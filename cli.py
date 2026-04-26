@@ -24,6 +24,12 @@ from langgraph.types import Command
 
 from agent import MAX_ITERATIONS, build_graph
 
+# Langfuse is optional — only attach if keys are set in .env.
+try:
+    from langfuse.langchain import CallbackHandler as _LangfuseHandler
+except ImportError:  # pragma: no cover
+    _LangfuseHandler = None
+
 ROOT = Path(__file__).parent
 CHECKPOINT_DIR = ROOT / "checkpoints"
 CHECKPOINT_DB = CHECKPOINT_DIR / "agent.db"
@@ -64,11 +70,24 @@ def _handle_interrupt(interrupt_objs) -> dict:
     return {"action": "reject"}
 
 
-def _stream_to_stdout(graph, query: str, thread_id: str) -> None:
+def _build_callbacks() -> list:
+    """Attach a Langfuse callback handler if its keys are present in .env."""
+    if _LangfuseHandler is None:
+        return []
+    if not (os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY")):
+        return []
+    return [_LangfuseHandler()]
+
+
+def _stream_to_stdout(graph, query: str, thread_id: str, callbacks: list | None = None) -> None:
     """Stream graph events to stdout, handling interrupts by prompting the user."""
     print(f"Q: {query}\n")
     answer_started = False
-    config = {"configurable": {"thread_id": thread_id}}
+    config = {
+        "configurable": {"thread_id": thread_id},
+        "callbacks": callbacks or [],
+        "metadata": {"langfuse_session_id": thread_id},
+    }
     next_input = {"query": query}
 
     while True:
@@ -135,10 +154,23 @@ def main() -> int:
     args = parser.parse_args()
     query = " ".join(args.query)
 
+    callbacks = _build_callbacks()
+    if callbacks:
+        print("[langfuse: tracing on]\n")
+
     CHECKPOINT_DIR.mkdir(exist_ok=True)
-    with SqliteSaver.from_conn_string(str(CHECKPOINT_DB)) as checkpointer:
-        graph = build_graph(checkpointer=checkpointer)
-        _stream_to_stdout(graph, query, args.thread)
+    try:
+        with SqliteSaver.from_conn_string(str(CHECKPOINT_DB)) as checkpointer:
+            graph = build_graph(checkpointer=checkpointer)
+            _stream_to_stdout(graph, query, args.thread, callbacks=callbacks)
+    finally:
+        # Ensure pending Langfuse events are sent before the process exits.
+        if callbacks:
+            from langfuse import get_client
+            try:
+                get_client().flush()
+            except Exception:
+                pass
 
     return 0
 

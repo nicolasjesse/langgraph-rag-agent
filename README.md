@@ -52,7 +52,7 @@ Multi-agent RAG system built with LangGraph — supervisor, retrieval, planner, 
 | Vector DB | **ChromaDB** (local file mode) | Embedding storage + similarity search |
 | Planner LLM | **Claude Sonnet 4.5** (Anthropic API) | Answer generation |
 | Embeddings | **OpenAI `text-embedding-3-small`** | Query/chunk vectors |
-| Observability *(Day 3)* | **Langfuse** | Prompt-level tracing, cost, latency |
+| Observability | **Langfuse** | Prompt-level tracing, cost, latency |
 | Deployment *(Day 3)* | **AWS Lambda + API Gateway** | Serverless inference |
 | CI/CD *(Day 3)* | **GitHub Actions** | Eval-gated deploys |
 
@@ -107,6 +107,18 @@ python -m pytest tests/
 ```
 
 Real-API + answer-quality coverage will live in `evals/` once Day 3 is complete.
+
+## Observability
+
+Every LLM call (supervisor, planner, verifier, direct_answer) is forwarded to
+Langfuse via a single callback handler attached at the CLI driver. Traces are
+tagged with `session_id = thread_id`, so multi-turn conversations group together
+in the dashboard.
+
+![Langfuse trace showing the supervisor → planner → verifier graph as nested spans, with the full prompt visible.](assets/langfuse-trace.png)
+
+Set `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` in `.env` to enable. Without
+them, the CLI runs unchanged — tracing is opt-in per environment.
 
 ## License
 
