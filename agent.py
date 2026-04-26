@@ -1,6 +1,8 @@
-"""Day 2 agent: supervisor routes queries to retrieval+planner or direct_answer.
+"""Day 2 agent with supervisor + verifier loop.
 
-Graph: START -> supervisor -> {direct_answer | retrieval -> planner} -> END
+Graph:
+    START -> supervisor -> {direct_answer -> END
+                          | retrieval -> planner -> verifier -> {END | retry-to-planner}}
 """
 
 from __future__ import annotations
@@ -22,8 +24,9 @@ CHROMA_DIR = ROOT / "chroma_db"
 COLLECTION_NAME = "langchain_docs"
 EMBED_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "claude-sonnet-4-5"           # planner — heavy reasoning
-CLASSIFIER_MODEL = "claude-haiku-4-5"      # supervisor + direct_answer — cheap
+CLASSIFIER_MODEL = "claude-haiku-4-5"      # supervisor + verifier + direct_answer — cheap
 TOP_K = 5
+MAX_ITERATIONS = 3                          # planner/verifier loop budget
 
 PLANNER_PROMPT = """You are an AI assistant for the LangChain and LangGraph Python documentation.
 
@@ -57,6 +60,23 @@ The user's message has been classified as one that does NOT require document loo
 Keep replies short — usually 1-3 sentences.
 """
 
+VERIFIER_PROMPT = """You are a quality checker for a RAG system.
+
+You will be given:
+1. The user's question
+2. The documentation chunks that were retrieved
+3. An answer that was generated
+
+Decide if the answer should pass:
+- It must use ONLY information present in the provided docs (no hallucinated facts).
+- It must actually address the question.
+- Minor stylistic or formatting issues are fine — only fail for hallucinations,
+  factual errors, or off-topic responses.
+
+Return passes=true if it passes; otherwise passes=false with a one-sentence reason
+that the planner can use to correct the next attempt.
+"""
+
 
 class Classification(BaseModel):
     """Schema the supervisor LLM is forced to return."""
@@ -67,11 +87,21 @@ class Classification(BaseModel):
     reason: str = Field(description="One sentence explaining the classification.")
 
 
+class Verification(BaseModel):
+    """Schema the verifier LLM is forced to return."""
+
+    passes: bool = Field(description="True if the answer is well-grounded in the docs.")
+    reason: str = Field(description="One sentence explaining the decision.")
+
+
 class AgentState(TypedDict):
     query: str
     category: str
     retrieved_docs: list[dict]
     answer: str
+    iteration_count: int
+    verifier_passes: bool
+    verifier_feedback: str
 
 
 def _get_collection():
@@ -112,6 +142,15 @@ def planner_node(state: AgentState) -> dict:
         f"[{d['source']}]\n{d['text']}" for d in state["retrieved_docs"]
     )
     user_message = f"Context:\n\n{context}\n\nQuestion: {state['query']}"
+
+    feedback = state.get("verifier_feedback") or ""
+    iteration = state.get("iteration_count", 0)
+    if iteration > 0 and feedback:
+        user_message += (
+            f"\n\nNote: a previous attempt was rejected by the verifier. "
+            f"Reason: {feedback}\nProduce a corrected answer that addresses this."
+        )
+
     response = llm.invoke(
         [
             ("system", PLANNER_PROMPT),
@@ -119,6 +158,31 @@ def planner_node(state: AgentState) -> dict:
         ]
     )
     return {"answer": response.content}
+
+
+def verifier_node(state: AgentState) -> dict:
+    llm = ChatAnthropic(model=CLASSIFIER_MODEL, temperature=0).with_structured_output(
+        Verification
+    )
+    context = "\n\n".join(
+        f"[{d['source']}]\n{d['text']}" for d in state["retrieved_docs"]
+    )
+    user_message = (
+        f"Question: {state['query']}\n\n"
+        f"Retrieved docs:\n{context}\n\n"
+        f"Answer to verify:\n{state['answer']}"
+    )
+    result = llm.invoke(
+        [
+            ("system", VERIFIER_PROMPT),
+            ("user", user_message),
+        ]
+    )
+    return {
+        "verifier_passes": result.passes,
+        "verifier_feedback": result.reason,
+        "iteration_count": state.get("iteration_count", 0) + 1,
+    }
 
 
 def direct_answer_node(state: AgentState) -> dict:
@@ -137,11 +201,21 @@ def _route_after_supervisor(state: AgentState) -> str:
     return state["category"]
 
 
+def _route_after_verifier(state: AgentState) -> str:
+    """Conditional edge after verifier — pass, retry, or give up."""
+    if state.get("verifier_passes"):
+        return "end"
+    if state.get("iteration_count", 0) >= MAX_ITERATIONS:
+        return "end"   # budget exhausted — return what we have
+    return "retry"
+
+
 def build_graph():
     graph = StateGraph(AgentState)
     graph.add_node("supervisor", supervisor_node)
     graph.add_node("retrieval", retrieval_node)
     graph.add_node("planner", planner_node)
+    graph.add_node("verifier", verifier_node)
     graph.add_node("direct_answer", direct_answer_node)
 
     graph.add_edge(START, "supervisor")
@@ -155,7 +229,12 @@ def build_graph():
         },
     )
     graph.add_edge("retrieval", "planner")
-    graph.add_edge("planner", END)
+    graph.add_edge("planner", "verifier")
+    graph.add_conditional_edges(
+        "verifier",
+        _route_after_verifier,
+        {"end": END, "retry": "planner"},
+    )
     graph.add_edge("direct_answer", END)
 
     return graph.compile()
@@ -198,11 +277,23 @@ def main() -> int:
                 docs = chunk["retrieval"].get("retrieved_docs", [])
                 sources = sorted({d["source"] for d in docs})
                 print(f"[retrieval: {len(docs)} chunks from {len(sources)} source(s)]\n")
+            elif "verifier" in chunk:
+                v = chunk["verifier"]
+                if v.get("verifier_passes"):
+                    print(f"\n[verifier: pass]")
+                else:
+                    n = v.get("iteration_count", "?")
+                    reason = v.get("verifier_feedback", "")
+                    if n != "?" and n >= MAX_ITERATIONS:
+                        print(f"\n[verifier: fail (budget exhausted at iter {n}) — {reason}]")
+                    else:
+                        print(f"\n[verifier: retry (iter {n}) — {reason}]\n")
+                        answer_started = False   # next planner attempt prints fresh "A: "
         elif mode == "messages":
             msg_chunk, metadata = chunk
             node = (metadata or {}).get("langgraph_node")
             if node not in ("planner", "direct_answer"):
-                continue   # skip supervisor's JSON tokens
+                continue   # skip supervisor + verifier JSON tokens
             if not answer_started:
                 print("A: ", end="", flush=True)
                 answer_started = True

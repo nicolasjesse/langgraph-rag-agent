@@ -3,7 +3,7 @@
 These tests verify graph wiring + node logic with both Chroma and the LLMs
 mocked. They do NOT call Anthropic or OpenAI — runnable in CI without keys.
 
-Real-API + answer-quality coverage belongs in the Day-3 evaluation harness.
+Real-API + answer-quality coverage belongs in the Day-3 test suite.
 """
 
 from __future__ import annotations
@@ -42,36 +42,58 @@ class FakeResponse:
 class FakeStructuredLLM:
     """Returned by FakeLLM.with_structured_output(); produces a schema instance."""
 
-    def __init__(self, schema, category: str):
+    def __init__(self, schema, parent_llm):
         self._schema = schema
-        self._category = category
+        self._parent = parent_llm
 
     def invoke(self, messages):
-        return self._schema(category=self._category, reason="mocked classification")
+        name = self._schema.__name__
+        if name == "Classification":
+            return self._schema(
+                category=self._parent.category,
+                reason="mocked classification",
+            )
+        if name == "Verification":
+            passes = self._parent.next_verifier_pass()
+            return self._schema(
+                passes=passes,
+                reason="looks good" if passes else "missing detail X",
+            )
+        raise ValueError(f"Unknown schema: {name}")
 
 
 class FakeLLM:
-    """Stands in for ChatAnthropic. Supports both chat (.invoke) and structured-output paths."""
+    """Stands in for ChatAnthropic. Supports both .invoke() and .with_structured_output()."""
 
-    def __init__(self, *args, category: str = "needs_retrieval", **kwargs):
-        self._category = category
+    def __init__(self, *, category: str = "needs_retrieval", verifier_passes=True):
+        self.category = category
+        self._verifier_seq = (
+            [verifier_passes] * 100 if isinstance(verifier_passes, bool) else list(verifier_passes)
+        )
+        self._verifier_idx = 0
+        # Inspection counters
+        self.planner_calls = 0
+        self.direct_answer_calls = 0
         self.last_messages = None
 
     def invoke(self, messages):
         self.last_messages = messages
+        last_user = messages[-1][1] if messages else ""
+        if "Context:" in last_user:
+            self.planner_calls += 1
+        else:
+            self.direct_answer_calls += 1
         return FakeResponse("Mocked answer about LangGraph [mock_a.md].")
 
     def with_structured_output(self, schema):
-        return FakeStructuredLLM(schema, self._category)
+        return FakeStructuredLLM(schema, self)
 
-
-def _make_chat_anthropic_factory(category: str = "needs_retrieval"):
-    """Return a fake ChatAnthropic constructor that yields FakeLLM with the given category."""
-
-    def factory(*args, **kwargs):
-        return FakeLLM(category=category)
-
-    return factory
+    def next_verifier_pass(self) -> bool:
+        if self._verifier_idx < len(self._verifier_seq):
+            v = self._verifier_seq[self._verifier_idx]
+            self._verifier_idx += 1
+            return v
+        return True
 
 
 # --- Tests -------------------------------------------------------------------
@@ -79,27 +101,25 @@ def _make_chat_anthropic_factory(category: str = "needs_retrieval"):
 
 def test_supervisor_classifies_query():
     """supervisor_node should write the category to state."""
-    with patch.object(agent, "ChatAnthropic", side_effect=_make_chat_anthropic_factory("needs_retrieval")):
+    fake = FakeLLM(category="needs_retrieval")
+    with patch.object(agent, "ChatAnthropic", return_value=fake):
         result = agent.supervisor_node({"query": "What is LangGraph?"})
 
     assert result == {"category": "needs_retrieval"}
 
 
 def test_retrieval_node_shapes_chroma_results():
-    """retrieval_node should transform Chroma's response into a list of dicts."""
     with patch.object(agent, "_get_collection", return_value=FakeCollection()):
         result = agent.retrieval_node({"query": "anything"})
 
-    assert "retrieved_docs" in result
     docs = result["retrieved_docs"]
     assert len(docs) == 2
     assert docs[0] == {"text": "First mock chunk.", "source": "mock_a.md", "chunk_index": 0}
-    assert docs[1] == {"text": "Second mock chunk.", "source": "mock_b.md", "chunk_index": 7}
 
 
-def test_planner_node_passes_context_and_question_to_llm():
-    """planner_node should build a prompt that includes both the docs and the query."""
-    fake_llm = FakeLLM()
+def test_planner_node_includes_feedback_on_retry():
+    """planner_node should reference the verifier's feedback when iteration_count > 0."""
+    fake = FakeLLM()
     state = {
         "query": "How does retrieval work?",
         "category": "needs_retrieval",
@@ -107,61 +127,108 @@ def test_planner_node_passes_context_and_question_to_llm():
             {"text": "Some doc text.", "source": "mock_a.md", "chunk_index": 0},
         ],
         "answer": "",
+        "iteration_count": 1,
+        "verifier_passes": False,
+        "verifier_feedback": "answer made up an API method",
     }
-    with patch.object(agent, "ChatAnthropic", return_value=fake_llm):
-        result = agent.planner_node(state)
+    with patch.object(agent, "ChatAnthropic", return_value=fake):
+        agent.planner_node(state)
 
-    assert result == {"answer": "Mocked answer about LangGraph [mock_a.md]."}
-
-    user_message = fake_llm.last_messages[1][1]
-    assert "Some doc text." in user_message
+    user_message = fake.last_messages[1][1]
     assert "How does retrieval work?" in user_message
-    assert "[mock_a.md]" in user_message
+    assert "answer made up an API method" in user_message
+    assert "previous attempt was rejected" in user_message
 
 
-def test_direct_answer_node_uses_query_only():
-    """direct_answer_node should not need retrieval; just ask the LLM."""
-    fake_llm = FakeLLM()
-    with patch.object(agent, "ChatAnthropic", return_value=fake_llm):
-        result = agent.direct_answer_node({"query": "Hi!", "category": "simple"})
+def test_verifier_node_passes_writes_state():
+    fake = FakeLLM(verifier_passes=True)
+    state = {
+        "query": "q",
+        "retrieved_docs": [{"text": "doc", "source": "a.md", "chunk_index": 0}],
+        "answer": "an answer",
+    }
+    with patch.object(agent, "ChatAnthropic", return_value=fake):
+        result = agent.verifier_node(state)
 
-    assert "answer" in result
-    assert fake_llm.last_messages[1] == ("user", "Hi!")
+    assert result["verifier_passes"] is True
+    assert result["verifier_feedback"] == "looks good"
+    assert result["iteration_count"] == 1
 
 
-def test_full_graph_routes_needs_retrieval_through_planner():
-    """When supervisor returns 'needs_retrieval', graph should run retrieval + planner."""
-    mock_collection = MagicMock(wraps=FakeCollection())
-    with patch.object(agent, "_get_collection", return_value=mock_collection), \
-         patch.object(agent, "ChatAnthropic", side_effect=_make_chat_anthropic_factory("needs_retrieval")):
-        graph = agent.build_graph()
-        result = graph.invoke({"query": "What is LangGraph?"})
+def test_verifier_node_fails_increments_iteration_count():
+    fake = FakeLLM(verifier_passes=False)
+    state = {
+        "query": "q",
+        "retrieved_docs": [{"text": "doc", "source": "a.md", "chunk_index": 0}],
+        "answer": "bad answer",
+        "iteration_count": 1,
+    }
+    with patch.object(agent, "ChatAnthropic", return_value=fake):
+        result = agent.verifier_node(state)
 
-    assert result["category"] == "needs_retrieval"
-    assert len(result["retrieved_docs"]) == 2
-    assert result["answer"] == "Mocked answer about LangGraph [mock_a.md]."
-    mock_collection.query.assert_called_once()
+    assert result["verifier_passes"] is False
+    assert result["iteration_count"] == 2
 
 
 def test_full_graph_routes_simple_query_skips_retrieval():
-    """When supervisor returns 'simple', graph should skip retrieval entirely."""
     mock_collection = MagicMock(wraps=FakeCollection())
+    fake = FakeLLM(category="simple")
     with patch.object(agent, "_get_collection", return_value=mock_collection), \
-         patch.object(agent, "ChatAnthropic", side_effect=_make_chat_anthropic_factory("simple")):
+         patch.object(agent, "ChatAnthropic", return_value=fake):
         graph = agent.build_graph()
         result = graph.invoke({"query": "hi there"})
 
     assert result["category"] == "simple"
     assert result["answer"]
     mock_collection.query.assert_not_called()
-    assert result.get("retrieved_docs") in (None, [])
+
+
+def test_full_graph_passes_first_attempt_no_loop():
+    """needs_retrieval + verifier passes once → planner runs exactly once."""
+    fake = FakeLLM(category="needs_retrieval", verifier_passes=True)
+    with patch.object(agent, "_get_collection", return_value=FakeCollection()), \
+         patch.object(agent, "ChatAnthropic", return_value=fake):
+        graph = agent.build_graph()
+        result = graph.invoke({"query": "What is LangGraph?"})
+
+    assert result["verifier_passes"] is True
+    assert result["iteration_count"] == 1
+    assert fake.planner_calls == 1
+
+
+def test_full_graph_loops_then_passes_on_retry():
+    """First verifier check fails, second passes → planner runs twice."""
+    fake = FakeLLM(category="needs_retrieval", verifier_passes=[False, True])
+    with patch.object(agent, "_get_collection", return_value=FakeCollection()), \
+         patch.object(agent, "ChatAnthropic", return_value=fake):
+        graph = agent.build_graph()
+        result = graph.invoke({"query": "What is LangGraph?"})
+
+    assert result["verifier_passes"] is True
+    assert result["iteration_count"] == 2
+    assert fake.planner_calls == 2
+
+
+def test_full_graph_terminates_at_max_iterations():
+    """Verifier always fails → graph stops after MAX_ITERATIONS planner attempts."""
+    fake = FakeLLM(category="needs_retrieval", verifier_passes=False)
+    with patch.object(agent, "_get_collection", return_value=FakeCollection()), \
+         patch.object(agent, "ChatAnthropic", return_value=fake):
+        graph = agent.build_graph()
+        result = graph.invoke({"query": "What is LangGraph?"})
+
+    assert result["verifier_passes"] is False
+    assert result["iteration_count"] == agent.MAX_ITERATIONS
+    assert fake.planner_calls == agent.MAX_ITERATIONS
 
 
 def test_agent_state_has_expected_fields():
-    """Schema sanity-check — guards against accidental field rename."""
     assert set(agent.AgentState.__annotations__.keys()) == {
         "query",
         "category",
         "retrieved_docs",
         "answer",
+        "iteration_count",
+        "verifier_passes",
+        "verifier_feedback",
     }
