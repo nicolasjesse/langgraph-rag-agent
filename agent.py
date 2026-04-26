@@ -83,6 +83,16 @@ def build_graph():
     return graph.compile()
 
 
+def _print_chunk_content(content) -> None:
+    """Print a streamed message chunk's content, handling both str and block-list shapes."""
+    if isinstance(content, str):
+        print(content, end="", flush=True)
+    elif isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                print(block.get("text", ""), end="", flush=True)
+
+
 def main() -> int:
     load_dotenv()
     if not os.getenv("ANTHROPIC_API_KEY") or not os.getenv("OPENAI_API_KEY"):
@@ -95,8 +105,22 @@ def main() -> int:
     query = " ".join(sys.argv[1:])
 
     graph = build_graph()
-    result = graph.invoke({"query": query})
-    print(result["answer"])
+    print(f"Q: {query}\n")
+
+    for mode, chunk in graph.stream(
+        {"query": query},
+        stream_mode=["updates", "messages"],
+    ):
+        if mode == "updates" and "retrieval" in chunk:
+            docs = chunk["retrieval"].get("retrieved_docs", [])
+            sources = sorted({d["source"] for d in docs})
+            print(f"[retrieval: {len(docs)} chunks from {len(sources)} source(s)]\n")
+            print("A: ", end="", flush=True)
+        elif mode == "messages":
+            msg_chunk, _meta = chunk
+            _print_chunk_content(msg_chunk.content)
+
+    print()  # trailing newline
     return 0
 
 
