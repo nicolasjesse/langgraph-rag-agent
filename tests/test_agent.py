@@ -11,6 +11,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
 
 import agent
 
@@ -158,18 +159,19 @@ def test_verifier_node_passes_writes_state():
 
 
 def test_verifier_node_fails_increments_iteration_count():
+    """At iter=0+1=1 (below HITL_TRIGGER) the verifier just returns; no interrupt."""
     fake = FakeLLM(verifier_passes=False)
     state = {
         "query": "q",
         "retrieved_docs": [{"text": "doc", "source": "a.md", "chunk_index": 0}],
         "answer": "bad answer",
-        "iteration_count": 1,
+        "iteration_count": 0,
     }
     with patch.object(agent, "ChatAnthropic", return_value=fake):
         result = agent.verifier_node(state)
 
     assert result["verifier_passes"] is False
-    assert result["iteration_count"] == 2
+    assert result["iteration_count"] == 1
 
 
 def test_full_graph_routes_simple_query_skips_retrieval():
@@ -211,19 +213,6 @@ def test_full_graph_loops_then_passes_on_retry():
     assert fake.planner_calls == 2
 
 
-def test_full_graph_terminates_at_max_iterations():
-    """Verifier always fails → graph stops after MAX_ITERATIONS planner attempts."""
-    fake = FakeLLM(category="needs_retrieval", verifier_passes=False)
-    with patch.object(agent, "_get_collection", return_value=FakeCollection()), \
-         patch.object(agent, "ChatAnthropic", return_value=fake):
-        graph = agent.build_graph()
-        result = graph.invoke({"query": "What is LangGraph?"})
-
-    assert result["verifier_passes"] is False
-    assert result["iteration_count"] == agent.MAX_ITERATIONS
-    assert fake.planner_calls == agent.MAX_ITERATIONS
-
-
 def test_agent_state_has_expected_fields():
     assert set(agent.AgentState.__annotations__.keys()) == {
         "query",
@@ -234,6 +223,85 @@ def test_agent_state_has_expected_fields():
         "verifier_passes",
         "verifier_feedback",
     }
+
+
+def _drive_until_interrupt(graph, initial_input, config):
+    """Stream the graph until it hits an interrupt; return the interrupt payload (or None)."""
+    for chunk in graph.stream(initial_input, config=config, stream_mode="updates"):
+        if "__interrupt__" in chunk:
+            return chunk["__interrupt__"][0].value
+    return None
+
+
+def test_verifier_interrupts_at_hitl_trigger():
+    """When the verifier rejects at HITL_TRIGGER (iter=2), the graph should pause."""
+    fake = FakeLLM(category="needs_retrieval", verifier_passes=False)
+    checkpointer = InMemorySaver()
+    config = {"configurable": {"thread_id": "hitl-trigger"}}
+
+    with patch.object(agent, "_get_collection", return_value=FakeCollection()), \
+         patch.object(agent, "ChatAnthropic", return_value=fake):
+        graph = agent.build_graph(checkpointer=checkpointer)
+        payload = _drive_until_interrupt(graph, {"query": "What is X?"}, config)
+
+    assert payload is not None
+    assert payload["type"] == "verifier_failed"
+    assert payload["iteration"] == agent.HITL_TRIGGER
+
+    snapshot = graph.get_state(config)
+    assert snapshot.next == ("verifier",)  # paused inside the verifier node
+
+
+def test_human_approve_resumes_with_passes_true():
+    fake = FakeLLM(category="needs_retrieval", verifier_passes=False)
+    checkpointer = InMemorySaver()
+    config = {"configurable": {"thread_id": "hitl-approve"}}
+
+    with patch.object(agent, "_get_collection", return_value=FakeCollection()), \
+         patch.object(agent, "ChatAnthropic", return_value=fake):
+        graph = agent.build_graph(checkpointer=checkpointer)
+        _drive_until_interrupt(graph, {"query": "What is X?"}, config)
+        graph.invoke(Command(resume={"action": "approve"}), config=config)
+
+    final = graph.get_state(config).values
+    assert final["verifier_passes"] is True
+    assert "approved by human" in final["verifier_feedback"]
+
+
+def test_human_rewrite_replaces_answer():
+    fake = FakeLLM(category="needs_retrieval", verifier_passes=False)
+    checkpointer = InMemorySaver()
+    config = {"configurable": {"thread_id": "hitl-rewrite"}}
+
+    with patch.object(agent, "_get_collection", return_value=FakeCollection()), \
+         patch.object(agent, "ChatAnthropic", return_value=fake):
+        graph = agent.build_graph(checkpointer=checkpointer)
+        _drive_until_interrupt(graph, {"query": "What is X?"}, config)
+        graph.invoke(
+            Command(resume={"action": "rewrite", "answer": "human-written answer"}),
+            config=config,
+        )
+
+    final = graph.get_state(config).values
+    assert final["answer"] == "human-written answer"
+    assert final["verifier_passes"] is True
+
+
+def test_human_reject_ends_with_budget_exhausted():
+    fake = FakeLLM(category="needs_retrieval", verifier_passes=False)
+    checkpointer = InMemorySaver()
+    config = {"configurable": {"thread_id": "hitl-reject"}}
+
+    with patch.object(agent, "_get_collection", return_value=FakeCollection()), \
+         patch.object(agent, "ChatAnthropic", return_value=fake):
+        graph = agent.build_graph(checkpointer=checkpointer)
+        _drive_until_interrupt(graph, {"query": "What is X?"}, config)
+        graph.invoke(Command(resume={"action": "reject"}), config=config)
+
+    final = graph.get_state(config).values
+    assert final["verifier_passes"] is False
+    assert final["iteration_count"] == agent.MAX_ITERATIONS
+    assert "rejected by human" in final["verifier_feedback"]
 
 
 def test_checkpointer_persists_state_under_thread_id():

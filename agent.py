@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, interrupt
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).parent
@@ -31,6 +32,7 @@ CHAT_MODEL = "claude-sonnet-4-5"           # planner — heavy reasoning
 CLASSIFIER_MODEL = "claude-haiku-4-5"      # supervisor + verifier + direct_answer — cheap
 TOP_K = 5
 MAX_ITERATIONS = 3                          # planner/verifier loop budget
+HITL_TRIGGER = 2                            # iteration at which to escalate to a human
 
 PLANNER_PROMPT = """You are an AI assistant for the LangChain and LangGraph Python documentation.
 
@@ -165,6 +167,10 @@ def planner_node(state: AgentState) -> dict:
 
 
 def verifier_node(state: AgentState) -> dict:
+    # NOTE: on resume after interrupt(), this node re-runs from the top — so the
+    # LLM call below executes a second time. Cost is small (Haiku) and the
+    # verifier is deterministic at temperature=0. A production split would
+    # move the LLM call into a separate node so resume doesn't repeat it.
     llm = ChatAnthropic(model=CLASSIFIER_MODEL, temperature=0).with_structured_output(
         Verification
     )
@@ -182,10 +188,47 @@ def verifier_node(state: AgentState) -> dict:
             ("user", user_message),
         ]
     )
+
+    new_iter = state.get("iteration_count", 0) + 1
+
+    # Escalate to a human when the verifier rejects at the HITL trigger iteration.
+    if not result.passes and new_iter == HITL_TRIGGER:
+        decision = interrupt(
+            {
+                "type": "verifier_failed",
+                "iteration": new_iter,
+                "max_iterations": MAX_ITERATIONS,
+                "verifier_reason": result.reason,
+                "answer": state["answer"],
+            }
+        )
+        action = (decision or {}).get("action")
+
+        if action == "approve":
+            return {
+                "verifier_passes": True,
+                "verifier_feedback": "approved by human",
+                "iteration_count": new_iter,
+            }
+        if action == "rewrite":
+            return {
+                "answer": (decision or {}).get("answer", state["answer"]),
+                "verifier_passes": True,
+                "verifier_feedback": "rewritten by human",
+                "iteration_count": new_iter,
+            }
+        # Anything else (including "reject") — give up. Bump iter to MAX so the
+        # router takes the "end" path with verifier_passes=False.
+        return {
+            "verifier_passes": False,
+            "verifier_feedback": f"rejected by human (verifier said: {result.reason})",
+            "iteration_count": MAX_ITERATIONS,
+        }
+
     return {
         "verifier_passes": result.passes,
         "verifier_feedback": result.reason,
-        "iteration_count": state.get("iteration_count", 0) + 1,
+        "iteration_count": new_iter,
     }
 
 
@@ -254,46 +297,83 @@ def _print_chunk_content(content) -> None:
                 print(block.get("text", ""), end="", flush=True)
 
 
+def _handle_interrupt(interrupt_objs) -> dict:
+    """Render the interrupt context and ask the user what to do."""
+    payload = interrupt_objs[0].value
+    print()
+    print("=" * 60)
+    print("[!] HUMAN REVIEW REQUIRED")
+    print("=" * 60)
+    print(f"After {payload['iteration']} attempt(s), the verifier still rejected the answer.")
+    print(f"\nVerifier's reason:\n  {payload['verifier_reason']}")
+    print(f"\nCurrent answer:\n{payload['answer']}")
+    print()
+    print("Options:")
+    print("  [a]pprove — accept this answer as-is")
+    print("  [r]eject  — give up, return current answer flagged as rejected")
+    print("  [w]rite   — type a custom answer to use instead")
+    choice = input("\nYour choice [a/r/w]: ").strip().lower()
+
+    if choice in ("a", "approve"):
+        return {"action": "approve"}
+    if choice in ("w", "write", "rewrite"):
+        custom = input("Type your answer:\n> ").strip()
+        return {"action": "rewrite", "answer": custom}
+    return {"action": "reject"}
+
+
 def _stream_to_stdout(graph, query: str, thread_id: str) -> None:
-    """Stream graph events to stdout — supervisor/retrieval/verifier traces + answer tokens."""
+    """Stream graph events to stdout, handling interrupts by prompting the user."""
     print(f"Q: {query}\n")
     answer_started = False
     config = {"configurable": {"thread_id": thread_id}}
+    next_input = {"query": query}
 
-    for mode, chunk in graph.stream(
-        {"query": query},
-        config=config,
-        stream_mode=["updates", "messages"],
-    ):
-        if mode == "updates":
-            if "supervisor" in chunk:
-                cat = chunk["supervisor"].get("category", "?")
-                print(f"[supervisor: {cat}]\n")
-            elif "retrieval" in chunk:
-                docs = chunk["retrieval"].get("retrieved_docs", [])
-                sources = sorted({d["source"] for d in docs})
-                print(f"[retrieval: {len(docs)} chunks from {len(sources)} source(s)]\n")
-            elif "verifier" in chunk:
-                v = chunk["verifier"]
-                if v.get("verifier_passes"):
-                    print(f"\n[verifier: pass]")
-                else:
-                    n = v.get("iteration_count", "?")
-                    reason = v.get("verifier_feedback", "")
-                    if n != "?" and n >= MAX_ITERATIONS:
-                        print(f"\n[verifier: fail (budget exhausted at iter {n}) — {reason}]")
+    while True:
+        interrupted = False
+        for mode, chunk in graph.stream(
+            next_input,
+            config=config,
+            stream_mode=["updates", "messages"],
+        ):
+            if mode == "updates":
+                if "__interrupt__" in chunk:
+                    decision = _handle_interrupt(chunk["__interrupt__"])
+                    next_input = Command(resume=decision)
+                    interrupted = True
+                    answer_started = False
+                    break
+                if "supervisor" in chunk:
+                    cat = chunk["supervisor"].get("category", "?")
+                    print(f"[supervisor: {cat}]\n")
+                elif "retrieval" in chunk:
+                    docs = chunk["retrieval"].get("retrieved_docs", [])
+                    sources = sorted({d["source"] for d in docs})
+                    print(f"[retrieval: {len(docs)} chunks from {len(sources)} source(s)]\n")
+                elif "verifier" in chunk:
+                    v = chunk["verifier"]
+                    if v.get("verifier_passes"):
+                        print(f"\n[verifier: pass — {v.get('verifier_feedback', '')}]")
                     else:
-                        print(f"\n[verifier: retry (iter {n}) — {reason}]\n")
-                        answer_started = False
-        elif mode == "messages":
-            msg_chunk, metadata = chunk
-            node = (metadata or {}).get("langgraph_node")
-            if node not in ("planner", "direct_answer"):
-                continue
-            if not answer_started:
-                print("A: ", end="", flush=True)
-                answer_started = True
-            _print_chunk_content(msg_chunk.content)
+                        n = v.get("iteration_count", "?")
+                        reason = v.get("verifier_feedback", "")
+                        if n != "?" and n >= MAX_ITERATIONS:
+                            print(f"\n[verifier: fail (budget exhausted at iter {n}) — {reason}]")
+                        else:
+                            print(f"\n[verifier: retry (iter {n}) — {reason}]\n")
+                            answer_started = False
+            elif mode == "messages":
+                msg_chunk, metadata = chunk
+                node = (metadata or {}).get("langgraph_node")
+                if node not in ("planner", "direct_answer"):
+                    continue
+                if not answer_started:
+                    print("A: ", end="", flush=True)
+                    answer_started = True
+                _print_chunk_content(msg_chunk.content)
+
+        if not interrupted:
+            break
 
     print(f"\n[checkpointed: thread={thread_id}]")
 
