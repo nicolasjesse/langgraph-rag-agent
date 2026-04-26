@@ -1,0 +1,52 @@
+[
+  {
+    "id": "q01",
+    "question": "What is LangGraph?",
+    "expected_keywords": ["agent", "graph"]
+  },
+  {
+    "id": "q02",
+    "question": "How do I install the LangGraph Python package?",
+    "expected_keywords": ["pip", "langgraph"]
+  },
+  {
+    "id": "q03",
+    "question": "What is the difference between InMemorySaver and SqliteSaver?",
+    "expected_keywords": ["InMemorySaver", "SqliteSaver"]
+  },
+  {
+    "id": "q04",
+    "question": "How do I attach a checkpointer when compiling a LangGraph?",
+    "expected_keywords": ["checkpointer", "compile"]
+  },
+  {
+    "id": "q05",
+    "question": "What does the interrupt() function do in a LangGraph node?",
+    "expected_keywords": ["interrupt", "pause"]
+  },
+  {
+    "id": "q06",
+    "question": "What is a conditional edge in LangGraph?",
+    "expected_keywords": ["conditional", "edge"]
+  },
+  {
+    "id": "q07",
+    "question": "How do I attach tools to a LangChain agent?",
+    "expected_keywords": ["tool"]
+  },
+  {
+    "id": "q08",
+    "question": "How do I stream LLM tokens from a LangGraph run?",
+    "expected_keywords": ["stream"]
+  },
+  {
+    "id": "q09",
+    "question": "What is a thread_id used for in LangGraph?",
+    "expected_keywords": ["thread", "checkpoint"]
+  },
+  {
+    "id": "q10",
+    "question": "What is structured output in LangChain?",
+    "expected_keywords": ["structured", "schema"]
+  }
+]

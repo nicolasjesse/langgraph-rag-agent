@@ -106,7 +106,19 @@ Mocked unit tests for the graph + nodes — run in <1s, no API keys needed:
 python -m pytest tests/
 ```
 
-Real-API + answer-quality coverage will live in `evals/` once Day 3 is complete.
+## Evals
+
+A real-API eval harness lives in `evals/`. It runs 10 question/expected-keyword
+pairs through the full graph and grades each answer. Exits non-zero on any
+failure, so it can gate deploys in CI.
+
+```bash
+python evals/run.py
+```
+
+Each run takes ~2 minutes and costs ~$0.15 in LLM calls. The grader is a simple
+case-insensitive keyword check — minimum viable for catching catastrophic
+regressions when prompts or retrieval change.
 
 ## Observability
 
