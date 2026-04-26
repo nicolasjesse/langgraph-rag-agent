@@ -7,6 +7,7 @@ Graph:
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -16,11 +17,14 @@ import chromadb
 from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).parent
 CHROMA_DIR = ROOT / "chroma_db"
+CHECKPOINT_DIR = ROOT / "checkpoints"
+CHECKPOINT_DB = CHECKPOINT_DIR / "agent.db"
 COLLECTION_NAME = "langchain_docs"
 EMBED_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "claude-sonnet-4-5"           # planner — heavy reasoning
@@ -210,7 +214,7 @@ def _route_after_verifier(state: AgentState) -> str:
     return "retry"
 
 
-def build_graph():
+def build_graph(checkpointer=None):
     graph = StateGraph(AgentState)
     graph.add_node("supervisor", supervisor_node)
     graph.add_node("retrieval", retrieval_node)
@@ -237,7 +241,7 @@ def build_graph():
     )
     graph.add_edge("direct_answer", END)
 
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
 
 
 def _print_chunk_content(content) -> None:
@@ -250,23 +254,15 @@ def _print_chunk_content(content) -> None:
                 print(block.get("text", ""), end="", flush=True)
 
 
-def main() -> int:
-    load_dotenv()
-    if not os.getenv("ANTHROPIC_API_KEY") or not os.getenv("OPENAI_API_KEY"):
-        print("ERROR: ANTHROPIC_API_KEY and OPENAI_API_KEY must be set in .env", file=sys.stderr)
-        return 1
-
-    if len(sys.argv) < 2:
-        print('Usage: python agent.py "your question here"', file=sys.stderr)
-        return 1
-    query = " ".join(sys.argv[1:])
-
-    graph = build_graph()
+def _stream_to_stdout(graph, query: str, thread_id: str) -> None:
+    """Stream graph events to stdout — supervisor/retrieval/verifier traces + answer tokens."""
     print(f"Q: {query}\n")
     answer_started = False
+    config = {"configurable": {"thread_id": thread_id}}
 
     for mode, chunk in graph.stream(
         {"query": query},
+        config=config,
         stream_mode=["updates", "messages"],
     ):
         if mode == "updates":
@@ -288,18 +284,40 @@ def main() -> int:
                         print(f"\n[verifier: fail (budget exhausted at iter {n}) — {reason}]")
                     else:
                         print(f"\n[verifier: retry (iter {n}) — {reason}]\n")
-                        answer_started = False   # next planner attempt prints fresh "A: "
+                        answer_started = False
         elif mode == "messages":
             msg_chunk, metadata = chunk
             node = (metadata or {}).get("langgraph_node")
             if node not in ("planner", "direct_answer"):
-                continue   # skip supervisor + verifier JSON tokens
+                continue
             if not answer_started:
                 print("A: ", end="", flush=True)
                 answer_started = True
             _print_chunk_content(msg_chunk.content)
 
-    print()  # trailing newline
+    print(f"\n[checkpointed: thread={thread_id}]")
+
+
+def main() -> int:
+    load_dotenv()
+    if not os.getenv("ANTHROPIC_API_KEY") or not os.getenv("OPENAI_API_KEY"):
+        print("ERROR: ANTHROPIC_API_KEY and OPENAI_API_KEY must be set in .env", file=sys.stderr)
+        return 1
+
+    parser = argparse.ArgumentParser(description="LangGraph RAG agent CLI.")
+    parser.add_argument("query", nargs="+", help="Your question.")
+    parser.add_argument(
+        "--thread", "-t", default="default",
+        help="Thread ID for checkpoint persistence (default: 'default').",
+    )
+    args = parser.parse_args()
+    query = " ".join(args.query)
+
+    CHECKPOINT_DIR.mkdir(exist_ok=True)
+    with SqliteSaver.from_conn_string(str(CHECKPOINT_DB)) as checkpointer:
+        graph = build_graph(checkpointer=checkpointer)
+        _stream_to_stdout(graph, query, args.thread)
+
     return 0
 
 

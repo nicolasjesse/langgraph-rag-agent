@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+from langgraph.checkpoint.memory import InMemorySaver
+
 import agent
 
 
@@ -232,3 +234,20 @@ def test_agent_state_has_expected_fields():
         "verifier_passes",
         "verifier_feedback",
     }
+
+
+def test_checkpointer_persists_state_under_thread_id():
+    """With a checkpointer, get_state(config) should return the final state for a thread."""
+    fake = FakeLLM(category="needs_retrieval", verifier_passes=True)
+    checkpointer = InMemorySaver()
+    config = {"configurable": {"thread_id": "test-thread"}}
+
+    with patch.object(agent, "_get_collection", return_value=FakeCollection()), \
+         patch.object(agent, "ChatAnthropic", return_value=fake):
+        graph = agent.build_graph(checkpointer=checkpointer)
+        graph.invoke({"query": "What is LangGraph?"}, config=config)
+
+    snapshot = graph.get_state(config)
+    assert snapshot.values["query"] == "What is LangGraph?"
+    assert snapshot.values["verifier_passes"] is True
+    assert snapshot.values["iteration_count"] == 1
