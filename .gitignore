@@ -1,0 +1,69 @@
+# --- Private strategy / prep / AI assistant files (never commit) ---
+docs/
+CLAUDE.md
+AGENTS.md
+.claude/
+.cursor/
+.aider*
+*.local.md
+NOTES.md
+TODO.md
+
+# --- Secrets ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+credentials.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# --- LangGraph / RAG project artifacts ---
+chroma_db/
+*.sqlite
+*.sqlite3
+*.db
+checkpoints/
+langgraph_checkpoints/
+
+# --- Corpus (gitignored by default — see note in README) ---
+# The scraped/copied docs corpus may contain large files or
+# content with unclear redistribution rights. Re-ingest locally.
+corpus/
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# --- Logs / outputs ---
+*.log
+logs/
+outputs/
+
+# --- Container / deploy artifacts (not the source) ---
+*.zip
+.aws-sam/
+lambda-package/
