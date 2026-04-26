@@ -45,6 +45,19 @@ aws iam delete-role --role-name "${ROLE_NAME}" 2>/dev/null || true
 echo ">> Deleting ECR repo (force, removes images)..."
 aws ecr delete-repository --repository-name "${FN}" --region "${REGION}" --force 2>/dev/null || true
 
+echo ">> Deleting CI IAM user + policy (used by GitHub Actions)..."
+CI_USER="${FN}-ci"
+CI_POLICY="${FN}-ci-policy"
+CI_POLICY_ARN="arn:aws:iam::${ACCOUNT}:policy/${CI_POLICY}"
+# Delete access keys first
+for k in $(aws iam list-access-keys --user-name "${CI_USER}" \
+            --query 'AccessKeyMetadata[].AccessKeyId' --output text 2>/dev/null); do
+  aws iam delete-access-key --user-name "${CI_USER}" --access-key-id "$k" 2>/dev/null || true
+done
+aws iam detach-user-policy --user-name "${CI_USER}" --policy-arn "${CI_POLICY_ARN}" 2>/dev/null || true
+aws iam delete-policy --policy-arn "${CI_POLICY_ARN}" 2>/dev/null || true
+aws iam delete-user --user-name "${CI_USER}" 2>/dev/null || true
+
 echo ""
 echo ">> Removing LAMBDA_* lines from .env..."
 if [[ -f .env ]]; then

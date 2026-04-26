@@ -70,7 +70,7 @@ def main() -> int:
         print(f"unknown action: {action!r}; expected one of: approve | reject | rewrite", file=sys.stderr)
         return 2
 
-    print(f"Q: What is LangGraph?")
+    print("Q: What is LangGraph?")
     print("(planner is patched to deliberately hallucinate twice; HITL kicks in at iter=2)")
     print(f"(simulated human action on interrupt: {action!r})\n")
 

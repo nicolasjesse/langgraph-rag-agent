@@ -54,7 +54,7 @@ Multi-agent RAG system built with LangGraph — supervisor, retrieval, planner, 
 | Embeddings | **OpenAI `text-embedding-3-small`** | Query/chunk vectors |
 | Observability | **Langfuse** | Prompt-level tracing, cost, latency |
 | Deployment | **AWS Lambda + API Gateway** | Serverless inference (container image, REST API, API-key auth) |
-| CI/CD *(Day 3)* | **GitHub Actions** | Eval-gated deploys |
+| CI/CD | **GitHub Actions** | Eval-gated deploys (lint → tests → ingest → evals → ECR push → Lambda update) |
 
 ## Corpus
 
@@ -145,6 +145,28 @@ curl -XPOST "$LAMBDA_API_URL" \
 Without the `x-api-key` header the gateway returns `403 Forbidden`. The
 default usage plan is **30 requests/day · 1 RPS · burst 2**, capping
 worst-case spend at roughly $1.50/day if the key ever leaks.
+
+## CI/CD
+
+Every push to `main` runs the full pipeline in `.github/workflows/ci.yml`:
+
+```
+checkout → install deps → ruff → unit tests
+        → scrape corpus → ingest → eval suite (the gate)
+        → if eval passed: docker buildx → push to ECR → update Lambda
+```
+
+The eval suite is the **deploy gate**: if any of the 10 keyword-graded test
+cases fails, the workflow halts before pushing the new image. This is
+*"treat prompts and evals like code"* in practice — a prompt change that
+regresses the test set never reaches production.
+
+CI uses a **deploy-only IAM user** (`langgraph-rag-agent-ci`) with permissions
+scoped to this single Lambda function and ECR repo. Worst-case impact of
+leaked CI credentials is bounded to *that one Lambda*.
+
+GitHub secrets used:
+`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`.
 
 ## Observability
 

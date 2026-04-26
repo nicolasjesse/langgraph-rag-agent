@@ -1,0 +1,92 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPO: langgraph-rag-agent
+  LAMBDA_FN: langgraph-rag-agent
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  test-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff
+
+      - name: Lint (ruff)
+        run: ruff check . --exclude .venv
+
+      - name: Unit tests (mocked, no API keys needed)
+        run: python -m pytest tests/ -v
+
+      - name: Build corpus from llms.txt
+        run: python scrape_corpus.py
+
+      - name: Ingest into ChromaDB
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: python ingest.py
+
+      - name: Eval gate (10 keyword-graded test cases)
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python evals/run.py
+
+      # ----- everything below runs only if every step above passed -----
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build + push image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          ECR_URI="$ECR_REGISTRY/$ECR_REPO"
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false --sbom=false \
+            -t "$ECR_URI:latest" \
+            -t "$ECR_URI:$GITHUB_SHA" \
+            --push .
+
+      - name: Update Lambda function
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          ECR_URI="$ECR_REGISTRY/$ECR_REPO"
+          aws lambda update-function-code \
+            --function-name "$LAMBDA_FN" \
+            --image-uri "$ECR_URI:latest" \
+            --region "$AWS_REGION" >/dev/null
+          aws lambda wait function-updated \
+            --function-name "$LAMBDA_FN" \
+            --region "$AWS_REGION"
+          echo "Deployed image: $ECR_URI:$GITHUB_SHA"
