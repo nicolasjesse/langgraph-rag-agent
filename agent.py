@@ -23,7 +23,9 @@ from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).parent
-CHROMA_DIR = ROOT / "chroma_db"
+# CHROMA_DB_PATH lets the Lambda runtime point at /tmp/chroma_db (writable);
+# locally it defaults to ./chroma_db.
+CHROMA_DIR = Path(os.getenv("CHROMA_DB_PATH", str(ROOT / "chroma_db")))
 COLLECTION_NAME = "langchain_docs"
 EMBED_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "claude-sonnet-4-5"           # planner — heavy reasoning
@@ -190,7 +192,10 @@ def verifier_node(state: AgentState) -> dict:
     new_iter = state.get("iteration_count", 0) + 1
 
     # Escalate to a human when the verifier rejects at the HITL trigger iteration.
-    if not result.passes and new_iter == HITL_TRIGGER:
+    # interrupt() requires a checkpointer; stateless runtimes (Lambda) should set
+    # HITL_ENABLED=false in the environment to skip this path.
+    hitl_enabled = os.getenv("HITL_ENABLED", "true").lower() != "false"
+    if not result.passes and new_iter == HITL_TRIGGER and hitl_enabled:
         decision = interrupt(
             {
                 "type": "verifier_failed",

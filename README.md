@@ -53,7 +53,7 @@ Multi-agent RAG system built with LangGraph — supervisor, retrieval, planner, 
 | Planner LLM | **Claude Sonnet 4.5** (Anthropic API) | Answer generation |
 | Embeddings | **OpenAI `text-embedding-3-small`** | Query/chunk vectors |
 | Observability | **Langfuse** | Prompt-level tracing, cost, latency |
-| Deployment *(Day 3)* | **AWS Lambda + API Gateway** | Serverless inference |
+| Deployment | **AWS Lambda + API Gateway** | Serverless inference (container image, REST API, API-key auth) |
 | CI/CD *(Day 3)* | **GitHub Actions** | Eval-gated deploys |
 
 ## Corpus
@@ -119,6 +119,32 @@ python evals/run.py
 Each run takes ~2 minutes and costs ~$0.15 in LLM calls. The grader is a simple
 case-insensitive keyword check — minimum viable for catching catastrophic
 regressions when prompts or retrieval change.
+
+## Deployment
+
+The agent ships as a container image to **AWS Lambda**, fronted by **API
+Gateway** with an API-key requirement and a tight per-day quota.
+
+```bash
+./deploy.sh        # build → push to ECR → create/update Lambda + API Gateway
+./teardown.sh      # delete everything when you're done
+```
+
+`deploy.sh` is idempotent — re-running just rebuilds the image and updates
+the function code; the API Gateway, key, and usage plan are reused.
+
+The endpoint URL and API key are written into `.env` (gitignored). Sample call:
+
+```bash
+curl -XPOST "$LAMBDA_API_URL" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: $LAMBDA_API_KEY" \
+  -d '{"query": "What is a checkpointer in LangGraph?"}'
+```
+
+Without the `x-api-key` header the gateway returns `403 Forbidden`. The
+default usage plan is **30 requests/day · 1 RPS · burst 2**, capping
+worst-case spend at roughly $1.50/day if the key ever leaks.
 
 ## Observability
 
