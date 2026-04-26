@@ -88,7 +88,7 @@ python ingest.py           # chunks (800-token / 100-overlap), embeds, stores in
 Ask a question — answer is streamed and grounded in retrieved chunks with filename citations:
 
 ```bash
-python agent.py "What is LangGraph and how does it differ from LangChain?"
+python cli.py "What is LangGraph and how does it differ from LangChain?"
 ```
 
 Inspect retrieval directly (no LLM call, useful for tuning chunking / `top_k`):
