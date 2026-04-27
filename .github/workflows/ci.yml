@@ -3,6 +3,14 @@ name: CI/CD
 on:
   push:
     branches: [main]
+    # Skip the eval gate on changes that can't affect runtime behavior.
+    # Code/Dockerfile/workflow changes still trigger the full pipeline.
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "assets/**"
+      - "demos/**"
+      - "LICENSE"
   workflow_dispatch:
 
 env:
